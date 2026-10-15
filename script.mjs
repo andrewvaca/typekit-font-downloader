@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 
-import { $, chalk } from "zx";
-const fs = require("fs");
-const log = require("fancy-log");
-const https = require('https');
-const cssJson = require('cssjson');
+import { chalk, argv } from "zx";
+import fs from "fs";
+import https from "https";
+import log from "fancy-log";
+import cssJson from "cssjson";
+import { patchFont } from "./patch-names.mjs";
 
 const CSS_FOLDER = './css';
 const FONTS_FOLDER = './fonts';
@@ -107,52 +108,81 @@ async function create_definition() {
     })
 }
 
-// Download the font source files
+// Download a single font binary to disk and resolve once fully written.
+function downloadOne(fontUrl, filepath) {
+    return new Promise((resolve, reject) => {
+        https.get(fontUrl, (response) => {
+            if (response.statusCode !== 200) {
+                reject(new Error(`Request failed. Status Code: ${response.statusCode}.`));
+                return;
+            }
+            const stream = fs.createWriteStream(filepath);
+            response.pipe(stream);
+            stream.on('finish', () => stream.close(resolve));
+            stream.on('error', reject);
+        }).on('error', reject);
+    });
+}
+
+// Fetch the CSS once for a given format user-agent and return its body.
+function fetchCss(headers) {
+    return new Promise((resolve, reject) => {
+        https.get(FONT_KIT_URL, { headers }, (response) => {
+            if (response.statusCode !== 200) {
+                reject(new Error(`Request failed. Status Code: ${response.statusCode}.`));
+                return;
+            }
+            let content = '';
+            response.on('data', (chunk) => { content += chunk; });
+            response.on('end', () => resolve(content));
+        }).on('error', reject);
+    });
+}
+
+// Download the font source files. Adobe serves a different format per
+// user-agent, so we request the CSS once per format, then download every
+// referenced binary and patch its name table so it installs correctly.
 async function download_fontfiles() {
-    return new Promise(resolve => {
-        // Retrieve remote font source files
-        for (const format in FORMAT_USER_AGENTS) {
-            const headers = { 'User-Agent': FORMAT_USER_AGENTS[format] };
-            https.get(FONT_KIT_URL, { headers }, (response) => {
-                if (response.statusCode !== 200) {
-                    throw new Error(`Request failed. Status Code: ${response.statusCode}.`);
-                }
+    const downloads = [];
 
-                // Content is the body of the HTTP response
-                let content = '';
-                response.on('data', (chunk) => {
-                    content += chunk;
-                });
+    for (const format in FORMAT_USER_AGENTS) {
+        const content = await fetchCss({ 'User-Agent': FORMAT_USER_AGENTS[format] });
 
-                response.on('end', () => {
-                    for (const fontFaceRule of content.match(/@font-face {[^}]+}/g)) {
-                        const fontFamily = fontFaceRule.match(/font-family:\s*"([^"]+)"/)[1];
-                        const fontWeight = fontFaceRule.match(/font-weight:\s*([^;]+);/)[1];
-                        const fontStyle = fontFaceRule.match(/font-style:\s*([^;]+);/)[1];
-                        const fontUrlAndFormats = fontFaceRule.match(/url\("([^"]+)"\)\s+format\("([^"]+)"\)/g);
-                        
+        for (const fontFaceRule of content.match(/@font-face {[^}]+}/g)) {
+            const fontFamily = fontFaceRule.match(/font-family:\s*"([^"]+)"/)[1];
+            const fontWeight = fontFaceRule.match(/font-weight:\s*([^;]+);/)[1];
+            const fontStyle = fontFaceRule.match(/font-style:\s*([^;]+);/)[1];
+            const fontUrlAndFormats = fontFaceRule.match(/url\("([^"]+)"\)\s+format\("([^"]+)"\)/g);
 
-                        for (const fontUrlAndFormat of fontUrlAndFormats) {
-                            const fontUrl = fontUrlAndFormat.match(/url\("([^"]+)"\)/)[1];
+            for (const fontUrlAndFormat of fontUrlAndFormats) {
+                const fontUrl = fontUrlAndFormat.match(/url\("([^"]+)"\)/)[1];
+                const fontFormat = fontUrlAndFormat.match(/format\("([^"]+)"\)/)[1].toLowerCase();
+                const extension = FORMAT_EXTENSIONS[fontFormat] || fontFormat;
+                const filename = `${fontFamily}_${fontWeight}_${fontStyle}.${extension}`;
 
-                            const fontFormat = fontUrlAndFormat.match(/format\("([^"]+)"\)/)[1].toLowerCase();
-                            const extension = FORMAT_EXTENSIONS[fontFormat] || fontFormat;
-
-                            const filename = `${fontFamily}_${fontWeight}_${fontStyle}.${extension}`;
-
-                            if (!downloadedFonts[filename]) {
-                                https.get(fontUrl, (response) => {
-                                    //log(`Downloaded "${fontFamily}" font family for "${fontFormat}" format in ${fontWeight} weight and ${fontStyle} style.`);
-                                    response.pipe(fs.createWriteStream(`${FONTS_FOLDER}/${filename}`));
+                if (!downloadedFonts[filename]) {
+                    downloadedFonts[filename] = true;
+                    FONT_FAMILY_NAME = fontFamily;
+                    downloads.push(
+                        downloadOne(fontUrl, `${FONTS_FOLDER}/${filename}`).then(() => {
+                            // Only sfnt formats carry a name table we can fix.
+                            if (extension === 'otf' || extension === 'ttf') {
+                                patchFont(`${FONTS_FOLDER}/${filename}`, {
+                                    family: fontFamily,
+                                    weight: fontWeight,
+                                    style: fontStyle,
                                 });
                             }
-                        }
-                    }
-                    resolve(FONT_FAMILY_NAME);
-                });
-            });
+                            log(`Downloaded "${fontFamily}" ${fontWeight} ${fontStyle} (${extension}).`);
+                        })
+                    );
+                }
+            }
         }
-    })
+    }
+
+    await Promise.all(downloads);
+    return FONT_FAMILY_NAME;
 }
 
 
